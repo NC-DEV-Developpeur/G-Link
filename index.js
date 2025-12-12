@@ -1,9 +1,13 @@
 import path from "node:path";
 import { google } from "googleapis";
 import { CancelTuningJobResponse, GoogleGenAI } from "@google/genai";
+
 import { Buffer } from "node:buffer";
 import { writeFile } from "node:fs/promises";
 import 'dotenv/config';
+import  potrace from "potrace";
+const ratioQuality=110;
+const maxIterationAI=1;
 
 class GoogleHelper {
   constructor() {
@@ -179,56 +183,143 @@ A fully redrawn version of the plan that is accurate, clean, and ready for profe
   getSystemPromptAgent2() {
     const promptAgent2 = {
       text: `### ROLE & OBJECTIVE
-You are a Senior Architectural Quality Assurance Specialist. Your task is to rigorously evaluate the quality of a processed architectural floor plan (\`scanOutput\`) by comparing it against the original source scan (\`scanInput\`).
+You are a Senior Architectural Drafter and QA Specialist. Your task is to strictly evaluate the **graphical representation and drafting quality** of a processed floor plan attached.
+
+**Your Focus:** You are grading the sketch/scan comparing to a professional CAD drawing. You are NOT grading the architectural design itself.
 
 ### INPUT DATA
-1. **scanInput:** The raw source image/sketch.
-2. **scanOutput:** The final generated architectural drawing to be graded.
+I will give an image to work on.
 
-### EVALUATION CRITERIA
-You must analyze the \`scanOutput\` based on the following three pillars. Deduct points for any deviations from professional drafting standards.
+### STRICT NEGATIVE CONSTRAINTS (CRITICAL)
+- **NO Structural Advice:** Do not suggest adding windows, doors, or walls.
+- **NO Design Critique:** Do not comment on room layout, flow, lighting, or building code compliance.
+- **NO Layout Modification:** Do not request moving walls or changing dimensions.
+- **Graphical Only:** If a room has no windows in the image is correct if it also has no windows.
 
-1. **Image Integrity & Fidelity:**
-   - Assess resolution, contrast, and clarity.
-   - Ensure the output is free from digital artifacts, noise, or hallucinated elements not present in the input.
+### DETAILED SCORING ALGORITHM (0-100)
+To ensure consistency, apply the following strict deduction logic. Start at 100 and deduct based on the severity of graphical errors.
 
-2. **Line Work & Precision:**
-   - **Rectilinearity:** Walls should be perfectly straight and orthogonal where appropriate.
-   - **Line Weight:** Verify distinction between structural elements (thick lines for cut walls) and details (thin lines for furniture/dimensions).
-   - **Smoothness:** Lines must be continuous and sharp, not jagged or pixelated.
+**TIER 1: PROFESSIONAL CAD (Score 90-100)**
+* **Condition:** Lines are perfectly straight (vector-sharp), corners are 90° (where applicable), and line weights clearly distinguish walls from furniture.
+* **Allowed Defects:** None. Zero hallucinations.
+* **Symbolism:** All doors/windows from input are converted to perfect standard CAD symbols.
 
-3. **Standardization of Openings (Doors & Windows):**
-   - **Doors:** Must be represented by standard architectural symbols (e.g., quarter-circle swings) indicating direction and width. They must not appear as simple gaps.
-   - **Windows:** Must be depicted with standard conventions (e.g., double or triple lines within the wall thickness) to denote glass and frames.
+**TIER 2: USABLE DRAFT (Score 75-89)**
+* **Condition:** Structurally accurate but lacks "polish".
+* **Penalty Triggers (-5 to -15 pts):**
+    * *Minor Jitter:* Lines are mostly straight but have slight "hand-drawn" wobble.
+    * *Inconsistent Weights:* Walls and furniture have similar line thickness.
+    * *Symbol Issues:* A door swing is present but drawn clumsily (e.g., simple arc instead of a block).
 
-### SCORING SYSTEM (0-100)
-- **90-100:** Professional grade. Ready for construction documents. Perfect symbol usage and line quality.
-- **75-89:** Good draft. Minor line jitters or slight icon inconsistencies, but structurally accurate.
-- **50-74:** Mediocre. Issues with wall straightness, unclear door swings, or low resolution. Needs manual cleanup.
-- **0-49:** Reject. Major hallucinations, missing standardized symbols, or poor visual fidelity.
+**TIER 3: NEEDS CLEANUP (Score 50-74)**
+* **Condition:** The geometry is correct, but the graphical quality is poor.
+* **Penalty Triggers (Max Score is 74 if ANY of these exist):**
+    * *Wavy Lines:* Walls look like a raster trace rather than straight vector lines.
+    * *Gaping:* Doors/Windows are shown as simple holes/gaps in the wall without symbols.
+    * *Noise:* Visible specks or digital artifacts in empty spaces.
+
+**TIER 4: REJECT / FAIL (Score 0-49)**
+* **Condition:** The drawing is unusable or misleading.
+* **Fatal Triggers (Max Score is 49 if ANY of these exist):**
+    * *Hallucination:* The model invented a room, furniture, or wall not in the input.
+    * *Omission:* A wall or major element from the input is missing.
+    * *Geometric Distortion:* Walls are slanted/crooked where they should be straight.
+    * *Unintelligible:* Resolution is too low to read.
+
+### SCORING TIE-BREAKER
+If the output falls between two tiers (e.g., looks like Tier 2 but has one Tier 3 defect), **always assign the score from the lower tier.**
 
 ### OUTPUT FORMAT
-Return strictly a single JSON object. Do not include markdown formatting, preambles, or explanations outside the JSON.
+Return strictly a single JSON object.
+MANDATORY : Return a perfect formatted JSON object, WITHOUT \`\`\`json AND ANY other things like \n \d 
 
 {
-    "quality": 0, // Integer between 0 and 100
+    "quality": 0, // Integer based on the Algorithm above.
+    "detected_tier": "Tier X", // String: "Tier 1", "Tier 2", "Tier 3", or "Tier 4"
     "ameliorations": [
-        // List specific, actionable improvements based on the criteria above.
-        // Example: "Door swings in the north bedroom are missing normalized curvature.",
-        // Example: "Wall line weights are inconsistent in the living room area."
+        // List specific graphical defects that justified the score deduction.
+        // Format: "[Location/Element]: [Specific Graphical Defect]"
+        // Example: "Living Room: Wall lines are wavy/jittery, indicating poor vectorization."
+        // Example: "Entrance: Door symbol is missing, represented only as a gap."
     ]
 }`,
     };
-    return promptAgent1;
+    return promptAgent2;
   }
 
-  async generateContent(base64image, aiClient) {
+  async ponderatePlan(base64image, aiClient, startIteration=0, originalData, originalFile) {
+    this.generationConfig.systemInstruction={
+      parts: [this.getSystemPromptAgent2()]
+    };
+
+    console.log(this.generationConfig);
+    const req = {
+      model: this.modelAgent2,
+      contents: [{
+        parts: [
+          { inlineData: {
+            mimeType: 'image/png',
+            data: base64image
+          }}
+        ]
+      }],
+      config: this.generationConfig
+    };
+
+
+    const respAI = await aiClient.models.generateContent(req);
+    try {
+        if(respAI.candidates && respAI.candidates[0]) {
+            const contentResponseInline = respAI.candidates[0].content.parts[0];
+            console.log('Content response parts of the Agent 2:', contentResponseInline);
+            console.log('Ratio needed', ratioQuality);
+            console.log('Max iterations AI', maxIterationAI);
+            let clearedJSON=contentResponseInline.text;
+            // Supprimer les marqueurs markdown (```json au début et ``` à la fin)
+            clearedJSON=clearedJSON.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+            const parsedReponse=JSON.parse(clearedJSON);
+            console.log('JSON final', parsedReponse);
+
+            if(parseInt(parsedReponse.quality)<ratioQuality) {
+              // Our recursive processing system
+              for(let i=0;i<maxIterationAI;i++) {
+                // Recall Agent 1
+                const b64Image = await this.generateContent(originalData, aiClient, parsedReponse.ameliorations.join('|'));
+                if(b64Image && b64Image.b64 && b64Image.mimeType) {
+                    // Extraire le nom de fichier sans extension
+                    const filenameWithoutExt = path.parse(originalFile.name).name;
+                    await saveBase64ToFile(b64Image.mimeType, b64Image.b64, `processed_${filenameWithoutExt}_iteration_${i}_quality_${parseInt(parsedReponse.quality)}`);
+                }
+              }
+            }
+
+        } else {
+            console.error('Aucun candidat dans la réponse');
+            return false;
+        }
+    } catch(e) {
+        console.error('Error during pondering the image', e);
+        return false;
+    }
+
+  }
+
+  async generateContent(base64image, aiClient, recommandations=false) {
+    let recommandationsPrompted=(recommandations) ? `Here is some attention points to respect for the following plan: ${recommandations}` : '';
+    this.generationConfig.imageConfig = {
+      imageSize: "4K"
+    };
     const req = {
       model: this.modelAgent1,
-      contents: [{ inlineData: {
-        mimeType: 'image/png',
-        data: base64image
-      } }],
+      contents: [{
+        parts: [
+          { inlineData: {
+            mimeType: 'image/png',
+            data: base64image
+          }},
+          { text: recommandationsPrompted || '' }
+        ]
+      }],
       config: this.generationConfig
     };
 
@@ -236,7 +327,6 @@ Return strictly a single JSON object. Do not include markdown formatting, preamb
     try {
         if(respAI.candidates && respAI.candidates[0]) {
             const contentResponseInline = respAI.candidates[0].content.parts;
-            console.log('Content response parts:', contentResponseInline);
             
             if (contentResponseInline && contentResponseInline[0] && contentResponseInline[0].inlineData) {
                 const inlineData = contentResponseInline[0].inlineData;
@@ -248,8 +338,6 @@ Return strictly a single JSON object. Do not include markdown formatting, preamb
                     return false;
                 }
                 
-                console.log('MimeType:', mimeType);
-                console.log('Base64 data length:', base64Data.length);
                 
                 return { b64: base64Data, mimeType };
             } else {
@@ -304,7 +392,24 @@ async function saveBase64ToFile(mimeType, base64String, filename = null) {
   }
 }
 
+const vectorizePlan=(planPath, originalFileName) => {
+  console.log('--- Vectorizing with Po the plan', planPath);
+  console.log(potrace);
+  var params = {
+    background: 'white',
+    color: 'black'
+  };
+  potrace.trace(planPath, params, function(err, svg) {
+    if (err) throw err;
+    writeFile(originalFileName.split('.')[0] + '.svg', svg);
+  });
+}
+
 const main = async () => {
+  vectorizePlan(path.join(process.cwd(), 'processed_plan_3_2K.jpg'), 'processed_plan_3_2K.jpg');
+  vectorizePlan(path.join(process.cwd(), 'processed_plan_3_4K.jpg'), 'processed_plan_3_4K.jpg');
+
+  return;
   const helperGoogle = new GoogleHelper();
   // Drive section
   const authGoogle = await helperGoogle.authGoogleDrive();
@@ -325,6 +430,13 @@ const main = async () => {
             // Extraire le nom de fichier sans extension
             const filenameWithoutExt = path.parse(file.name).name;
             await saveBase64ToFile(b64Image.mimeType, b64Image.b64, `processed_${filenameWithoutExt}`);
+
+            // IGNORE Ponderate at this time
+            // const returnAgentPonderation = await helperAI.ponderatePlan(b64Image.base64, AIClient, b64file.base64, file);
+            // console.log(returnAgentPonderation);
+
+
+
         } else {
             console.error('Erreur: réponse invalide de generateContent pour', file.name);
         }
